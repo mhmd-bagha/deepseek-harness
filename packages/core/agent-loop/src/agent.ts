@@ -458,7 +458,22 @@ export class ReactLoopAgent implements Agent {
         signal.throwIfAborted()
       } catch (error: unknown) {
         if (!started) throw error
-        try {
+        const stalled = error instanceof StreamStallError && !signal.aborted
+        if (stalled) {
+          // A silent provider looks like a failed attempt to everything
+          // downstream: the finish-error path settles assistant/attempt and
+          // offers agent/request-error, so llm-retry can recover the turn.
+          // Settlement is left to that path; settling here too would commit
+          // the same attempt twice.
+          live.push({
+            type: 'finish',
+            reason: {
+              kind: 'error',
+              failure: { message: error.message, code: error.code },
+            },
+          })
+          signal.throwIfAborted()
+        } else try {
           if (signal.aborted) {
             const content = live.interruptedBlocks()
             if (content.length > 0) {
@@ -496,7 +511,7 @@ export class ReactLoopAgent implements Agent {
             { cause: error },
           )
         }
-        throw error
+        if (!stalled) throw error
       }
       try {
         const finish = live.finish

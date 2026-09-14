@@ -39,6 +39,14 @@ export const QUOTA_EXCEEDED_CODE = 'QUOTA'
 export const EMPTY_RESPONSE_CODE = 'EMPTY_RESPONSE'
 
 /**
+ * Canonical provider-neutral code for an assistant stream that stopped
+ * delivering chunks without closing or erroring. The stalled attempt is
+ * abandoned (partial chunks settle durably) and the retry is a fresh
+ * request, so retry policy treats it as safe to repeat — same as TIMEOUT.
+ */
+export const STREAM_STALL_CODE = 'stream-stall'
+
+/**
  * Canonical provider-neutral code for a credential that was supplied but
  * cannot be used — malformed rather than absent. Distinct from
  * `MISSING_CREDENTIAL` because the fix differs: correct the stored value

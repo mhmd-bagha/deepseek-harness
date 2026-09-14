@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import type { Fiber } from '@deepseek-ai/cordis'
-import LlmRuntime, { createUserMessage, ToolCallId, EMPTY_RESPONSE_CODE, LlmAdapter, LlmError, expandAssistantStream, resolveRetryPolicy  } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { createUserMessage, ToolCallId, EMPTY_RESPONSE_CODE, STREAM_STALL_CODE, LlmAdapter, LlmError, expandAssistantStream, resolveRetryPolicy  } from '@deepseek-ai/dsh-llm'
 import type {
   AlwaysRetryPolicyConfig,
   BackoffConfig,
@@ -257,6 +257,47 @@ describe('provider-routed retry policy', () => {
     expect(agent.session.deriveMessages().at(-1)).toMatchObject({
       role: 'assistant',
       content: [{ type: 'text', text: 'recovered' }],
+    })
+  })
+
+  it('retries a stream-stall error finish under the default retryable codes', async () => {
+    vi.useFakeTimers()
+    const adapter = new ScriptedAdapter([
+      // Same shape the agent-loop stall guard pushes when a provider goes
+      // silent: a finish-error chunk carrying the stall failure code.
+      [
+        { type: 'usage', usage: { inputTokens: 0, outputTokens: 0 } },
+        {
+          type: 'finish',
+          reason: {
+            kind: 'error',
+            failure: { message: 'assistant stream delivered no chunk for 90000ms', code: STREAM_STALL_CODE },
+          },
+        },
+      ],
+      textResponse('recovered after stall'),
+    ])
+    // No retryableCodes override: proves the default policy covers stalls,
+    // so a silent provider resyncs without the user steering.
+    ;({ ctx: context } = await harness(adapter))
+    const agent = await context.agentLoop.create(SessionId('retry-stream-stall'), { provider: 'mock', model: 'mock' })
+    const scheduled = waitForRetry(context, agent, 1)
+
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    const event = await scheduled
+    expect(event.data.failure).toEqual({
+      message: 'assistant stream delivered no chunk for 90000ms',
+      code: STREAM_STALL_CODE,
+    })
+
+    const idle = waitForIdle(context, agent)
+    await vi.advanceTimersByTimeAsync(500)
+    await idle
+
+    expect(adapter.requests).toHaveLength(2)
+    expect(agent.session.deriveMessages().at(-1)).toMatchObject({
+      role: 'assistant',
+      content: [{ type: 'text', text: 'recovered after stall' }],
     })
   })
 

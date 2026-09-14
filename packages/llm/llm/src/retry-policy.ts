@@ -9,7 +9,7 @@
 
 import z from '@deepseek-ai/schemastery'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
-import { EMPTY_RESPONSE_CODE } from './error.ts'
+import { EMPTY_RESPONSE_CODE, STREAM_STALL_CODE } from './error.ts'
 
 const DEFAULT_MAX_RETRIES = 5
 const DEFAULT_INITIAL_DELAY_MS = 500
@@ -19,6 +19,7 @@ const DEFAULT_RETRYABLE_CODES = Object.freeze([
   EMPTY_RESPONSE_CODE,
   'RATE_LIMIT',
   'SERVER',
+  STREAM_STALL_CODE,
   'TIMEOUT',
   'TRANSPORT',
 ])

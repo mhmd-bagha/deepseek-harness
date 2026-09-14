@@ -19,6 +19,7 @@ import { agentEvents, assembleContextFor } from '@deepseek-ai/dsh-agent'
 import type { GenerateOptions, LlmCallConfig, Message, PreparedLlmCall, StreamChunk } from '@deepseek-ai/dsh-llm'
 import {
   LlmError,
+  STREAM_STALL_CODE,
   createAssistantMessage,
   createUserMessage,
   errorChain,
@@ -87,7 +88,7 @@ function requestProposal(header: EpochHeader): LlmCallConfig {
 
 /** Drives one session through turn and step boundaries. */
 export class StreamStallError extends Error {
-  readonly code = 'stream-stall'
+  readonly code = STREAM_STALL_CODE
   constructor(readonly stallTimeoutMs: number) {
     super(`assistant stream delivered no chunk for ${String(stallTimeoutMs)}ms`)
     this.name = 'StreamStallError'

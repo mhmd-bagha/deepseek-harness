@@ -16,7 +16,7 @@ import type {
   RequestErrorAction,
 } from '@deepseek-ai/dsh-agent'
 import { agentEvents, assembleContextFor } from '@deepseek-ai/dsh-agent'
-import type { GenerateOptions, LlmCallConfig, Message, PreparedLlmCall } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, LlmCallConfig, Message, PreparedLlmCall, StreamChunk } from '@deepseek-ai/dsh-llm'
 import {
   LlmError,
   createAssistantMessage,
@@ -69,6 +69,65 @@ function requestProposal(header: EpochHeader): LlmCallConfig {
 }
 
 /** Drives one session through turn and step boundaries. */
+export class StreamStallError extends Error {
+  readonly code = 'stream-stall'
+  constructor(readonly stallTimeoutMs: number) {
+    super(`assistant stream delivered no chunk for ${String(stallTimeoutMs)}ms`)
+    this.name = 'StreamStallError'
+  }
+}
+
+/**
+ * Iterate a model chunk stream, racing each chunk against a stall watchdog.
+ * A provider that stops delivering chunks without closing or erroring would
+ * otherwise hang the step forever with no settlement and no retry.
+ * @param stream - the model chunk iterable.
+ * @param stallTimeoutMs - max silence between chunks; `0` disables the guard.
+ * @param signal - step abort signal; aborts the wait when the turn is steered.
+ */
+async function *guardStreamStallInternal(
+  stream: AsyncIterable<StreamChunk>,
+  stallTimeoutMs: number,
+  signal: AbortSignal,
+): AsyncGenerator<StreamChunk> {
+  if (stallTimeoutMs <= 0) {
+    yield* stream
+    return
+  }
+  const iterator = stream[Symbol.asyncIterator]()
+  // NOTE: never calls iterator.return() on the way out. Awaiting return()
+  // on an iterator parked at a never-settling promise hangs instead of
+  // completing, and abandoning the consumer side matches the existing
+  // steer-abort path: partial chunks stay accumulated, the catch block
+  // settles them, and the pending next() is dropped with the closure.
+  while (true) {
+    signal.throwIfAborted()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      const next = await Promise.race([
+        iterator.next(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new StreamStallError(stallTimeoutMs)),
+            stallTimeoutMs,
+          )
+        }),
+      ])
+      if (next.done === true) return
+      yield next.value
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+  }
+}
+
+/**
+ * Iterate a model chunk stream with stall protection. Exported for tests;
+ * production callers go through the step driver.
+ */
+export const guardStreamStall = guardStreamStallInternal
+
+/** Drives one session through turn and step boundaries. */
 export class ReactLoopAgent implements Agent {
   readonly inbox: ReactLoopInbox
   private phase: Phase
@@ -98,6 +157,7 @@ export class ReactLoopAgent implements Agent {
     public readonly id: SessionId,
     public readonly options: AgentOptions,
     public readonly session: Session,
+    private readonly streamStallTimeoutMs: number = 0,
   ) {
     this.requestSurfaceGeneration = session.surface.replaceGeneration
     this.dispatch = agentEvents(loopCtx, this)
@@ -391,14 +451,29 @@ export class ReactLoopAgent implements Agent {
         signal.throwIfAborted()
         live.start()
         started = true
-        for await (const chunk of stream) {
+        for await (const chunk of guardStreamStallInternal(stream, this.streamStallTimeoutMs, signal)) {
           signal.throwIfAborted()
           live.push(chunk)
         }
         signal.throwIfAborted()
       } catch (error: unknown) {
         if (!started) throw error
-        try {
+        const stalled = error instanceof StreamStallError && !signal.aborted
+        if (stalled) {
+          // A silent provider looks like a failed attempt to everything
+          // downstream: the finish-error path settles assistant/attempt and
+          // offers agent/request-error, so llm-retry can recover the turn.
+          // Settlement is left to that path; settling here too would commit
+          // the same attempt twice.
+          live.push({
+            type: 'finish',
+            reason: {
+              kind: 'error',
+              failure: { message: error.message, code: error.code },
+            },
+          })
+          signal.throwIfAborted()
+        } else try {
           if (signal.aborted) {
             const content = live.interruptedBlocks()
             if (content.length > 0) {
@@ -436,7 +511,7 @@ export class ReactLoopAgent implements Agent {
             { cause: error },
           )
         }
-        throw error
+        if (!stalled) throw error
       }
       try {
         const finish = live.finish

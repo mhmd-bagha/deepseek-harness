@@ -33,7 +33,7 @@ import type { ProjectionDefinition } from '@deepseek-ai/dsh-session-projection'
 import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence'
 import type { SessionHandle, SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import { ReactLoopAgent } from './agent.ts'
-import { DEFAULT_MAX_PARALLEL_TOOL_CALLS } from './constants.ts'
+import { DEFAULT_MAX_PARALLEL_TOOL_CALLS, DEFAULT_STREAM_STALL_TIMEOUT_MS, MIN_STREAM_STALL_TIMEOUT_MS } from './constants.ts'
 
 /** Fiber states that cannot own or serve a new lifecycle. */
 const INACTIVE_STATES: ReadonlySet<FiberState> = new Set([
@@ -195,6 +195,18 @@ function resolveMaxParallelToolCalls(value: number | undefined): number {
   return maxParallelToolCalls
 }
 
+/** Resolve the stream stall watchdog at the owning config boundary. */
+function resolveStreamStallTimeoutMs(value: number | undefined): number {
+  const streamStallTimeoutMs = value ?? DEFAULT_STREAM_STALL_TIMEOUT_MS
+  if (!Number.isInteger(streamStallTimeoutMs) || streamStallTimeoutMs < 0) {
+    throw new Error('streamStallTimeoutMs must be a non-negative integer')
+  }
+  if (streamStallTimeoutMs > 0 && streamStallTimeoutMs < MIN_STREAM_STALL_TIMEOUT_MS) {
+    throw new Error(`streamStallTimeoutMs must be 0 or at least ${String(MIN_STREAM_STALL_TIMEOUT_MS)}ms`)
+  }
+  return streamStallTimeoutMs
+}
+
 /** Reject an output-token cap that cannot be represented exactly on the request wire. */
 function assertAgentOptions(options: AgentOptions): void {
   if (options.maxTokens !== undefined
@@ -307,11 +319,17 @@ export const AGENT_LOOP_SETTINGS_NAMESPACE = 'agent-loop'
 export interface AgentLoopSettings {
   /** Maximum parallel-safe calls in flight per agent step. */
   maxParallelToolCalls: number
+  /**
+   * Max silence between assistant stream chunks before the attempt is
+   * abandoned and retried. `0` disables the watchdog.
+   */
+  streamStallTimeoutMs: number
 }
 
 /** Schema of the agent-loop settings section. */
 export const AGENT_LOOP_SETTINGS_SCHEMA: z<AgentLoopSettings> = z.object({
   maxParallelToolCalls: z.number().step(1).min(1).default(DEFAULT_MAX_PARALLEL_TOOL_CALLS),
+  streamStallTimeoutMs: z.number().step(1).min(0).default(DEFAULT_STREAM_STALL_TIMEOUT_MS),
 })
 
 /** Agent-loop plugin configuration. */
@@ -321,6 +339,12 @@ export interface Config {
    * omission defaults to {@link DEFAULT_MAX_PARALLEL_TOOL_CALLS}.
    */
   maxParallelToolCalls?: number
+  /**
+   * Max silence between assistant stream chunks before the attempt is
+   * abandoned and retried. `0` disables the watchdog; omission defaults to
+   * {@link DEFAULT_STREAM_STALL_TIMEOUT_MS}.
+   */
+  streamStallTimeoutMs?: number
   /** Agents created or resumed at plugin startup. */
   agents: (AgentOptions & {
     /** Stable config label used in logs and as the fresh combined-id prefix. */
@@ -335,7 +359,7 @@ export interface Config {
 }
 
 /** Agent-loop configuration after defaults and load-time validation. */
-type ResolvedConfig = Config & { maxParallelToolCalls: number }
+type ResolvedConfig = Config & { maxParallelToolCalls: number; streamStallTimeoutMs: number }
 
 /** Reject self-contained identity conflicts before any configured agent starts. */
 function validateConfiguredAgents(agents: Config['agents']): void {
@@ -362,6 +386,7 @@ export class AgentLoop extends Service implements AgentFactory {
   /** Runtime schema for declarative agents. */
   static Config = z.object({
     maxParallelToolCalls: z.number().step(1).min(1).default(DEFAULT_MAX_PARALLEL_TOOL_CALLS),
+    streamStallTimeoutMs: z.number().step(1).min(0).default(DEFAULT_STREAM_STALL_TIMEOUT_MS),
     agents: z.array(z.object({
       id: z.string().required(),
       sessionId: z.string().min(1),
@@ -385,6 +410,7 @@ export class AgentLoop extends Service implements AgentFactory {
 
     const entry: AgentLoopSettings = {
       maxParallelToolCalls: resolveMaxParallelToolCalls(config.maxParallelToolCalls),
+      streamStallTimeoutMs: resolveStreamStallTimeoutMs(config.streamStallTimeoutMs),
     }
     let source: () => AgentLoopSettings = () => entry
     this.config = {
@@ -396,13 +422,19 @@ export class AgentLoop extends Service implements AgentFactory {
       get maxParallelToolCalls() {
         return source().maxParallelToolCalls
       },
+      get streamStallTimeoutMs() {
+        return source().streamStallTimeoutMs
+      },
     }
     ctx.inject(['settings'], (settingsCtx) => {
       settingsCtx.settings.installSection(ctx, AGENT_LOOP_SETTINGS_NAMESPACE, AGENT_LOOP_SETTINGS_SCHEMA, entry, {
         // The schema admits any integer above zero; `resolveMaxParallelToolCalls`
         // owns the whole rule, so refusing here keeps the running scheduler on
         // its last good cap instead of failing at the next tool group.
-        validate: value => void resolveMaxParallelToolCalls(value.maxParallelToolCalls),
+        validate: (value) => {
+          void resolveMaxParallelToolCalls(value.maxParallelToolCalls)
+          void resolveStreamStallTimeoutMs(value.streamStallTimeoutMs)
+        },
         setSource: (current) => {
           source = current
         },
@@ -619,9 +651,10 @@ export class AgentLoop extends Service implements AgentFactory {
     })())
     const untrack = this.ownership.track(dispose)
     let unfollowOwner: () => Promise<void> | void
+    const stallTimeoutMs = this.config.streamStallTimeoutMs
     try {
       unfollowOwner = ownerCtx.effect(function* () {
-        machine = new ReactLoopAgent(loopCtx, id, options, session)
+        machine = new ReactLoopAgent(loopCtx, id, options, session, stallTimeoutMs)
         machineReady.resolve()
         yield machine.scope.rawDispose
         yield () => {

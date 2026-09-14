@@ -20,6 +20,7 @@ import type { GenerateOptions, LlmCallConfig, Message, PreparedLlmCall, StreamCh
 import {
   LlmError,
   createAssistantMessage,
+  createUserMessage,
   errorChain,
   markAgentLoopRequest,
 } from '@deepseek-ai/dsh-llm'
@@ -32,6 +33,15 @@ import { joinContextSections, renderContextSections, renderPrompt } from '@deeps
 import type { PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-session-projection'
 import type { Context } from '@deepseek-ai/cordis'
+
+// Structural read of the todo tool's projection without depending on its
+// package: the canonical key lives in `@deepseek-ai/dsh-tool-todo/types`.
+// Only `status`/`content` are read, so drift surface is two fields.
+declare module '@deepseek-ai/dsh-session-projection/types' {
+  interface SessionProjectionStateMap {
+    todos: readonly { readonly content: string; readonly status: string }[] | null
+  }
+}
 import { ReactLoopInbox } from './inbox.ts'
 import { RuntimeContextProjection } from './runtime-context.ts'
 import { AssistantStreamAttempt } from './assistant-stream.ts'
@@ -58,6 +68,13 @@ type PreparedStep =
     startsRequestSeries?: true
     assembly: PromptAssembly
   }
+
+/**
+ * Maximum driver-injected continuations per turn when open todos remain.
+ * Bounds token burn when the model genuinely cannot proceed: after the cap
+ * the turn ends normally and the human steers.
+ */
+const MAX_TODO_AUTO_CONTINUE_PER_TURN = 5
 
 /** Remove adapter-derived values before plugins propose the next request config. */
 function requestProposal(header: EpochHeader): LlmCallConfig {
@@ -148,6 +165,8 @@ export class ReactLoopAgent implements Agent {
   /** Process-local revision of assistant frames for this attached Session. */
   private assistantStreamRevision = 0
   private assistantAttemptCounter = 0
+  /** Driver-injected continuations this turn; reset per turn, capped per turn. */
+  private todoAutoContinues = 0
   private readonly systemPrompt: SystemPromptProjection
   /** Identities fully frozen by this loop; weak references do not retain replaced history. */
   private readonly frozenMessages = new WeakSet<Message>()
@@ -342,6 +361,7 @@ export class ReactLoopAgent implements Agent {
     phase.turn = turn
     let turnEnds: TurnEndReason | null = null
     let target: InboxTarget = 'next-turn'
+    this.todoAutoContinues = 0
     try {
       while (true) {
         signal.throwIfAborted()
@@ -373,6 +393,11 @@ export class ReactLoopAgent implements Agent {
         }
         signal.throwIfAborted()
         if (turnEnds && this.inbox.nextStep.length === 0) {
+          if (this.continueOpenTodos(turnEnds)) {
+            turnEnds = null
+            target = 'next-step'
+            continue
+          }
           await this.dispatch.serial('agent/turn-stopping', { turn, signal })
           signal.throwIfAborted()
         }
@@ -406,6 +431,31 @@ export class ReactLoopAgent implements Agent {
     // A fresh controller makes a latch set on the old one stale: the live driver claims the queue itself.
     phase.wakeRequested = false
     phase.step = 0
+    return true
+  }
+
+  /**
+   * Keep a turn alive when the model stopped with todos still open.
+   * Splices a driver nudge into next-step input so the next step continues
+   * the unfinished work instead of ending on a status announcement.
+   * @param ending - the reason the turn would otherwise end with.
+   * @returns true when the turn must continue for another step.
+   */
+  private continueOpenTodos(ending: TurnEndReason): boolean {
+    if (ending.kind !== 'completed') return false
+    if (this.todoAutoContinues >= MAX_TODO_AUTO_CONTINUE_PER_TURN) return false
+    const todos = this.loopCtx.sessionProjections.stateOf(this.session, 'todos')
+    const open = todos?.filter(item => item.status !== 'completed') ?? []
+    if (open.length === 0) return false
+    this.todoAutoContinues += 1
+    this.inbox.splice('next-step', this.inbox.nextStep.length, 0, [createUserMessage({
+      content: [{
+        type: 'text',
+        text: `Driver note: ${String(open.length)} todo item(s) still open (${open.map(item => item.content).join('; ')}). `
+          + 'Do not end with a status announcement; keep calling tools until every todo is completed.',
+      }],
+      source: { kind: 'user' },
+    })])
     return true
   }
 

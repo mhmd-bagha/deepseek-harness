@@ -61,7 +61,9 @@ const DESCRIPTION_SINGLE =
 const DESCRIPTION_TAIL =
   'Mark a todo '
   + '`completed` the moment it is done (do not batch completions), and allow no '
-  + '`in_progress` item only once all work is complete. Skip the list for trivial '
+  + '`in_progress` item only once all work is complete. Never end your turn with '
+  + 'a status announcement while any todo is `pending` or `in_progress`: keep '
+  + 'calling tools until every todo is `completed`. Skip the list for trivial '
   + 'single-step tasks. Statuses: `pending` (not started), `in_progress` (being '
   + 'worked on now), `completed` (finished).'
 

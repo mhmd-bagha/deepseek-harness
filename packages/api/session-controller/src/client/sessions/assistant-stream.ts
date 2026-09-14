@@ -22,6 +22,14 @@ interface ActiveAttempt {
   nextIndex: number
 }
 
+/**
+ * Silence after the last stream frame beyond which the attempt's frame
+ * channel is treated as dead and a staged durable settlement publishes
+ * immediately. Generous on purpose: live streams heartbeat far more often;
+ * only a lost terminal frame plus a dead follow can strand an attempt.
+ */
+const STALE_ATTEMPT_MS = 30_000
+
 /** One Web publication decision from the assistant stream fold. */
 export type ClientAssistantStreamResult =
   | { readonly type: 'publish'; readonly entry: SessionLiveEventEntry }
@@ -42,6 +50,14 @@ export class ClientAssistantStream {
   private publishedSeqs = new Set<number>()
   private durableCursor = -1
   private transientInGap = 0
+  /**
+   * Last wall-clock time a stream frame arrived for the active attempt.
+   * A settlement staged while the frame channel has been silent longer than
+   * STALE_ATTEMPT_MS means the terminal `end` frame was lost: the attempt
+   * settles presentation-side immediately instead of hiding the durable
+   * message in `pending` behind a spinner that never resolves.
+   */
+  private lastFrameAt: number | undefined
 
   /**
    * Replace the durable Web window and adopt an optional reconnect baseline.
@@ -56,6 +72,7 @@ export class ClientAssistantStream {
     this.pending.clear()
     this.transientInGap = 0
     this.activeAttempt = undefined
+    this.lastFrameAt = undefined
     const opening = baseline?.activeAttempt
     if (opening !== undefined) {
       this.activeAttempt = {
@@ -104,8 +121,18 @@ export class ClientAssistantStream {
     this.durableCursor = Math.max(this.durableCursor, event.seq)
     this.transientInGap = 0
     const settlement = assistantSettlementEntry(entry)
-    if (settlement !== undefined && this.attemptForSettlement(settlement.event) !== undefined) {
+    const attempt = settlement === undefined ? undefined : this.attemptForSettlement(settlement.event)
+    if (settlement !== undefined && attempt !== undefined) {
       if (this.pending.has(event.seq)) return { type: 'rebaseline' }
+      if (this.lastFrameAt !== undefined && Date.now() - this.lastFrameAt > STALE_ATTEMPT_MS) {
+        // The frame channel died before delivering the terminal `end`:
+        // publish the staged settlement now so the completed message
+        // replaces the stale spinner instead of hiding behind it.
+        this.activeAttempt = undefined
+        this.lastFrameAt = undefined
+        this.publishedSeqs.add(event.seq)
+        return { type: 'settlement', attemptId: attempt.attemptId, entry: settlement }
+      }
       this.pending.set(event.seq, settlement)
       return undefined
     }
@@ -122,6 +149,7 @@ export class ClientAssistantStream {
       case 'start':
         if (this.activeAttempt !== undefined || this.pending.size > 0) return { type: 'rebaseline' }
         this.pending.clear()
+        this.lastFrameAt = Date.now()
         this.activeAttempt = {
           attemptId: frame.attemptId,
           startedAfterSeq: frame.startedAfterSeq,
@@ -138,6 +166,7 @@ export class ClientAssistantStream {
         if (attempt === undefined || attempt.attemptId !== frame.attemptId) return undefined
         if (frame.index !== attempt.nextIndex) return { type: 'rebaseline' }
         attempt.nextIndex += 1
+        this.lastFrameAt = Date.now()
         this.transientInGap += 1
         return {
           type: 'transient',
@@ -163,6 +192,7 @@ export class ClientAssistantStream {
           return undefined
         }
         this.activeAttempt = undefined
+        this.lastFrameAt = undefined
         if (frame.index !== attempt.nextIndex) return { type: 'rebaseline' }
         if (frame.outcome.kind === 'abandoned') {
           return this.pending.size === 0

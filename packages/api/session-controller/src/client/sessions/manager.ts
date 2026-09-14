@@ -796,6 +796,10 @@ export class SessionManager {
     if (selectedAddress !== undefined) void this.refreshSubagents(selectedAddress.parentSessionId)
     if (this.selected !== undefined) void this.refreshSubagents(this.selected)
     for (const parentSessionId of this.openCatalogs) void this.refreshSubagents(parentSessionId)
+    // A follow that died mid-turn strands its chat on a stale spinner with
+    // the durable settlement unreachable. Re-open errored sessions so the
+    // window re-baselines and the UI resyncs without user action.
+    for (const session of this.sessions.values()) void session.reopenIfFailed()
   }
 
   /** Debounce membership refetches while one parent catalog is selected or open. */

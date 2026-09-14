@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { LlmAttemptId, createAssistantMessage } from '@deepseek-ai/dsh-llm'
 import { SessionSeq, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type {
@@ -190,8 +190,7 @@ describe('ClientAssistantStream', () => {
     expect(pending.acceptFrame(end(0, { kind: 'abandoned' }))).toEqual({ type: 'rebaseline' })
   })
 
-  it('rebaselines committed outcomes without one exact staged settlement', () => {
-    const published = new ClientAssistantStream()
+  it('rebaselines committed outcomes without one exact staged settlement', () => {    const published = new ClientAssistantStream()
     published.replace([attemptEvent(2)], baseline(0))
     expect(published.acceptFrame(end(0, {
       kind: 'committed', eventType: 'assistant/attempt', seq: 2,
@@ -207,5 +206,35 @@ describe('ClientAssistantStream', () => {
     expect(wrongType.acceptFrame(end(0, {
       kind: 'committed', eventType: 'assistant/attempt', seq: 2,
     }))).toEqual({ type: 'rebaseline' })
+  })
+
+  it('publishes a staged settlement when the frame channel went stale', () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(1_000_000)
+      // Healthy path first: frames flowing, settlement stages invisibly.
+      const live = opened()
+      expect(live.acceptFrame(chunkFrame(0))).toEqual(expect.objectContaining({ type: 'transient' }))
+      const staged = messageEvent(2)
+      expect(live.acceptDurable(staged)).toBeUndefined()
+
+      // Lost terminal frame: 31s of frame silence, then the durable
+      // settlement arrives on the still-open follow.
+      const stale = opened()
+      expect(stale.acceptFrame(chunkFrame(0))).toEqual(expect.objectContaining({ type: 'transient' }))
+      vi.setSystemTime(1_000_000 + 31_000)
+      const durable = messageEvent(2)
+      expect(stale.acceptDurable(durable)).toEqual({
+        type: 'settlement',
+        attemptId: String(ATTEMPT),
+        entry: durable,
+      })
+      // The late end frame finds no active attempt and stays quiet.
+      expect(stale.acceptFrame(end(1, {
+        kind: 'committed', eventType: 'assistant/message', seq: 2,
+      }))).toBeUndefined()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

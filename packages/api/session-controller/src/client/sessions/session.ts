@@ -469,6 +469,16 @@ export class Session implements SessionFace {
     await this.open()
   }
 
+  /**
+   * Rebuild the follow after a reconnect when it previously died. No-op for
+   * cold (never opened), loading, and healthy open sessions: only the error
+   * state strands the chat, so only it pays for a rebuild.
+   */
+  reopenIfFailed(): Promise<void> {
+    if (this.openState !== 'error') return Promise.resolve()
+    return this.resync()
+  }
+
   // ---- Subscription API (useSyncExternalStore direct wiring) ----
 
   /**
